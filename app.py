@@ -13,7 +13,6 @@ def get_gsheets_client():
         'https://www.googleapis.com/auth/spreadsheets',
         'https://www.googleapis.com/auth/drive'
     ]
-    # Mengambil rahasia dari konfigurasi TOML di Streamlit Cloud
     creds_dict = st.secrets["gcp_service_account"]
     creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
     client = gspread.authorize(creds)
@@ -27,8 +26,8 @@ SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1lv0b68kBixRgYmJJk1J6E
 # ==========================================
 def process_excel(file):
     """
-    Membaca file Excel, mengabaikan sheet lembur, dan mencari baris tanggal
-    untuk melakukan unpivot data secara otomatis.
+    Membaca file Excel, mengabaikan sheet lembur, membersihkan duplikasi kolom,
+    dan melakukan unpivot data secara otomatis dari sheet operasional harian.
     """
     xls = pd.ExcelFile(file)
     sheets = xls.sheet_names
@@ -45,27 +44,48 @@ def process_excel(file):
         try:
             df = pd.read_excel(file, sheet_name=sheet, header=None)
             
-            # Heuristik: Cari baris yang berfungsi sebagai header tanggal (berisi angka 1-31)
+            # Cari baris yang berfungsi sebagai header tanggal (berisi rentang angka hari 1-31 atau timestamp)
             date_row_idx = None
-            for i in range(min(15, len(df))): # Scan 15 baris pertama
-                row_values = pd.to_numeric(df.iloc[i], errors='coerce')
-                valid_days = row_values[(row_values >= 1) & (row_values <= 31)]
-                
-                # Jika ada minimal 15 kolom dengan angka hari, asumsikan ini baris tanggal
-                if len(valid_days) >= 15: 
+            for i in range(min(15, len(df))):
+                row_values = df.iloc[i]
+                numeric_days = 0
+                for val in row_values:
+                    if isinstance(val, (int, float)) and 1 <= val <= 31:
+                        numeric_days += 1
+                    elif isinstance(val, pd.Timestamp) or hasattr(val, 'day'):
+                        numeric_days += 1
+                if numeric_days >= 10:
                     date_row_idx = i
                     break
                     
             if date_row_idx is not None:
-                # Jadikan baris tersebut sebagai header sementara
-                df.columns = df.iloc[date_row_idx].fillna('Deskripsi')
-                
-                # Ambil data di bawah header dan buang baris kosong
+                # 1. Ambil nama kolom mentah dan lakukan deduplikasi agar tidak terjadi error duplicate id_vars
+                raw_cols = df.iloc[date_row_idx].fillna('Deskripsi').tolist()
+                seen = {}
+                new_cols = []
+                for c in raw_cols:
+                    if isinstance(c, (int, float)) and 1 <= c <= 31:
+                        new_cols.append(c)
+                    elif isinstance(c, pd.Timestamp) or hasattr(c, 'day'):
+                        new_cols.append(getattr(c, 'day', c))
+                    else:
+                        col_str = str(c).strip()
+                        if col_str in seen:
+                            seen[col_str] += 1
+                            new_cols.append(f"{col_str}_{seen[col_str]}")
+                        else:
+                            seen[col_str] = 0
+                            new_cols.append(col_str)
+                            
+                df.columns = new_cols
                 df_data = df.iloc[date_row_idx+1:].dropna(how='all')
                 
-                # Pisahkan kolom Identitas (teks) dan kolom Tanggal (angka)
+                # Pisahkan kolom Identitas dan kolom Tanggal (1-31)
                 id_vars = [col for col in df.columns if not isinstance(col, (int, float))]
                 value_vars = [col for col in df.columns if isinstance(col, (int, float)) and 1 <= col <= 31]
+                
+                if not value_vars:
+                    continue
                 
                 # UNPIVOT DATA (Melt)
                 melted = df_data.melt(
@@ -76,24 +96,28 @@ def process_excel(file):
                 )
                 
                 # Tambahkan metadata
+                filename = getattr(file, 'name', 'Laporan Bulanan')
                 melted['Sumber_Sheet'] = sheet
-                melted['Bulan_Laporan'] = file.name.split('.')[0]
+                melted['Bulan_Laporan'] = filename.split('.')[0]
                 
                 # Cleaning data
                 melted = melted.dropna(subset=['Jumlah_MP'])
                 melted['Jumlah_MP'] = pd.to_numeric(melted['Jumlah_MP'], errors='coerce').fillna(0)
-                melted = melted[melted['Jumlah_MP'] > 0] # Hanya ambil data yang ada isinya
+                melted = melted[melted['Jumlah_MP'] > 0] 
                 
-                # Ambil kolom identitas utama (asumsi kolom pertama dari kiri yang bukan angka)
                 if id_vars:
                     kolom_entitas = id_vars[0]
-                    # Susun ulang kolom untuk database
+                    for col in id_vars:
+                        if isinstance(col, str) and any(kw in col.lower() for kw in ['company', 'entity', 'vendor', 'nama', 'name', 'job', 'project']):
+                            kolom_entitas = col
+                            break
+                            
                     final_df = melted[['Bulan_Laporan', 'Sumber_Sheet', kolom_entitas, 'Tanggal', 'Jumlah_MP']]
                     final_df.columns = ['File_Sumber', 'Kategori', 'Entitas_Posisi', 'Tanggal', 'Jumlah']
                     all_data.append(final_df)
                     
         except Exception as e:
-            st.warning(f"Gagal memproses sheet '{sheet}': {e}")
+            st.warning(f"Catatan pada sheet '{sheet}': {e}")
                 
     if all_data:
         return pd.concat(all_data, ignore_index=True)
@@ -110,16 +134,16 @@ tab1, tab2 = st.tabs(["📈 Dashboard Utama", "⚙️ Upload & Sinkronisasi Data
 # --- TAB 2: UPLOAD DATA ---
 with tab2:
     st.subheader("Upload Laporan Harian (Excel)")
-    st.markdown("Unggah file **JDC MP Daily Report** Anda. Sistem akan memproses data kehadiran secara otomatis.")
+    st.markdown("Unggah file **JDC MP Daily Report** Anda. Sistem akan memproses data kehadiran dan entitas secara otomatis.")
     
     uploaded_file = st.file_uploader("Pilih file .xlsx", type=['xlsx'])
     
     if uploaded_file is not None:
-        with st.spinner("Memproses data..."):
+        with st.spinner("Memproses file Excel dengan algoritma cerdas..."):
             extracted_data = process_excel(uploaded_file)
             
             if not extracted_data.empty:
-                st.success(f"Berhasil mengekstrak {len(extracted_data)} baris data!")
+                st.success(f"Berhasil mengekstrak {len(extracted_data)} baris data operasional!")
                 st.dataframe(extracted_data.head(10))
                 
                 if st.button("💾 Simpan ke Google Sheets"):
@@ -128,11 +152,15 @@ with tab2:
                             client = get_gsheets_client()
                             sheet = client.open_by_url(SPREADSHEET_URL).sheet1
                             
-                            # Konversi data ke format list untuk gspread
+                            # Cek apakah sheet masih kosong, jika ya tambahkan header
+                            existing_data = sheet.get_all_values()
+                            if not existing_data:
+                                sheet.append_row(['File_Sumber', 'Kategori', 'Entitas_Posisi', 'Tanggal', 'Jumlah'])
+                                
                             data_to_upload = extracted_data.astype(str).values.tolist()
                             sheet.append_rows(data_to_upload)
                             
-                            st.success("Data berhasil ditambahkan ke Google Sheets! ✅")
+                            st.success("Data berhasil ditambahkan dan diamankan ke Google Sheets! ✅")
                         except Exception as e:
                             st.error(f"Gagal menyimpan ke Google Sheets: {e}")
             else:
@@ -142,9 +170,8 @@ with tab2:
 with tab1:
     st.subheader("Ringkasan Data Tersimpan")
     
-    # Tarik data dari Google Sheets
     df_db = pd.DataFrame()
-    with st.spinner("Memuat data dari database..."):
+    with st.spinner("Memuat data dari database Google Sheets..."):
         try:
             client = get_gsheets_client()
             sheet = client.open_by_url(SPREADSHEET_URL).sheet1
@@ -152,39 +179,42 @@ with tab1:
             if records:
                 df_db = pd.DataFrame(records)
         except Exception as e:
-            st.warning("Gagal terhubung ke Google Sheets atau file masih kosong.")
+            st.warning("Belum ada data tersimpan di Google Sheets atau koneksi gagal.")
         
     if not df_db.empty:
-        # Konversi tipe data agar bisa dihitung
+        # Konversi tipe data
         df_db['Jumlah'] = pd.to_numeric(df_db['Jumlah'], errors='coerce').fillna(0)
         df_db['Tanggal'] = pd.to_numeric(df_db['Tanggal'], errors='coerce')
         
         # --- Filter Interaktif ---
         col1, col2 = st.columns(2)
         kategori_list = df_db['Kategori'].unique().tolist()
-        pilihan_kategori = col1.multiselect("Filter Berdasarkan Kategori Sheet", kategori_list, default=kategori_list)
+        pilihan_kategori = col1.multiselect("Filter Berdasarkan Kategori / Sheet", kategori_list, default=kategori_list)
+        
+        file_list = df_db['File_Sumber'].unique().tolist() if 'File_Sumber' in df_db.columns else []
+        pilihan_file = col2.multiselect("Filter Berdasarkan Bulan / File", file_list, default=file_list)
         
         df_filtered = df_db[df_db['Kategori'].isin(pilihan_kategori)]
+        if pilihan_file and 'File_Sumber' in df_db.columns:
+            df_filtered = df_filtered[df_filtered['File_Sumber'].isin(pilihan_file)]
         
         if df_filtered.empty:
-            st.info("Pilih setidaknya satu kategori untuk menampilkan grafik.")
+            st.info("Pilih setidaknya satu kategori/file untuk menampilkan grafik.")
         else:
             # --- Indikator Utama (KPI) ---
             st.markdown("---")
             m1, m2, m3 = st.columns(3)
-            m1.metric("Total Manpower (Hari-Orang)", f"{int(df_filtered['Jumlah'].sum())}")
-            m2.metric("Jumlah Kategori", len(df_filtered['Kategori'].unique()))
-            m3.metric("Entitas/Posisi Terdaftar", len(df_filtered['Entitas_Posisi'].unique()))
+            m1.metric("Total Manpower (Hari-Orang)", f"{int(df_filtered['Jumlah'].sum()):,}")
+            m2.metric("Jumlah Kategori Aktif", len(df_filtered['Kategori'].unique()))
+            m3.metric("Total Entitas / Posisi", len(df_filtered['Entitas_Posisi'].unique()))
             
             # --- Visualisasi ---
             st.markdown("---")
             chart_col1, chart_col2 = st.columns(2)
             
             with chart_col1:
-                st.markdown("### Tren Harian")
-                # Agregasi data per tanggal dan kategori
+                st.markdown("### Tren Harian Manpower")
                 tren_harian = df_filtered.groupby(['Tanggal', 'Kategori'])['Jumlah'].sum().reset_index()
-                # Urutkan berdasarkan tanggal agar garisnya rapi
                 tren_harian = tren_harian.sort_values(by='Tanggal')
                 
                 fig_line = px.line(
@@ -193,14 +223,13 @@ with tab1:
                     y='Jumlah', 
                     color='Kategori', 
                     markers=True,
-                    labels={'Jumlah': 'Total Manpower', 'Tanggal': 'Tanggal Laporan'}
+                    labels={'Jumlah': 'Total Manpower', 'Tanggal': 'Tanggal'}
                 )
-                # Atur sumbu X agar menampilkan angka bulat
                 fig_line.update_xaxes(dtick=1)
                 st.plotly_chart(fig_line, use_container_width=True)
                 
             with chart_col2:
-                st.markdown("### Komposisi Top 10 Entitas/Posisi")
+                st.markdown("### Komposisi Top 10 Entitas / Posisi")
                 komposisi = df_filtered.groupby('Entitas_Posisi')['Jumlah'].sum().reset_index()
                 komposisi = komposisi.sort_values(by='Jumlah', ascending=False).head(10)
                 
@@ -218,6 +247,6 @@ with tab1:
                 
             # Menampilkan Raw Data Database di bawah
             with st.expander("Lihat Data Mentah (Tersimpan di GSheet)"):
-                st.dataframe(df_db)
+                st.dataframe(df_db, use_container_width=True)
     else:
-        st.info("Belum ada data. Silakan ke tab 'Upload & Sinkronisasi Data' untuk mengunggah laporan pertama Anda.")
+        st.info("Belum ada data di Google Sheets. Silakan ke tab 'Upload & Sinkronisasi Data' untuk mengunggah laporan bulanan Anda.")
