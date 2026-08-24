@@ -32,7 +32,7 @@ def process_excel(file):
     xls = pd.ExcelFile(file)
     sheets = xls.sheet_names
     
-    # Abaikan worksheet terkait lembur sesuai instruksi
+    # Abaikan worksheet terkait lembur
     ignore_keywords = ['ot', 'lembur', 'summary ot']
     
     all_data = []
@@ -44,7 +44,54 @@ def process_excel(file):
         try:
             df = pd.read_excel(file, sheet_name=sheet, header=None)
             
-            # Cari baris yang berfungsi sebagai header tanggal (berisi rentang angka hari 1-31 atau timestamp)
+            # --- PENANGANAN KHUSUS SHEET DW(ARU) ---
+            if 'aru' in sheet.lower():
+                header_row = 4
+                date_row = 5
+                data_start = 6
+                
+                if len(df) > data_start:
+                    raw_cols = df.iloc[header_row].tolist()
+                    date_vals = df.iloc[date_row].tolist()
+                    
+                    cols = []
+                    for idx, val in enumerate(raw_cols):
+                        if pd.notna(val):
+                            cols.append(str(val).strip())
+                        else:
+                            cols.append(f"Col_{idx}")
+                            
+                    for idx, val in enumerate(date_vals):
+                        if isinstance(val, pd.Timestamp) or hasattr(val, 'day'):
+                            cols[idx] = val.day
+                            
+                    df.columns = cols
+                    df_data = df.iloc[data_start:data_start+1].dropna(how='all') # Ambil baris headcount
+                    
+                    id_vars = [col for col in df.columns if not isinstance(col, int)]
+                    value_vars = [col for col in df.columns if isinstance(col, int) and 1 <= col <= 31]
+                    
+                    if value_vars:
+                        melted = df_data.melt(id_vars=id_vars, value_vars=value_vars, var_name='Tanggal', value_name='Jumlah_MP')
+                        filename = getattr(file, 'name', 'Laporan Bulanan')
+                        melted['Sumber_Sheet'] = sheet
+                        melted['Bulan_Laporan'] = filename.split('.')[0]
+                        melted['Jumlah_MP'] = pd.to_numeric(melted['Jumlah_MP'], errors='coerce').fillna(0)
+                        melted = melted[melted['Jumlah_MP'] > 0]
+                        
+                        kolom_entitas = id_vars[0] if id_vars else 'Entity'
+                        for col in id_vars:
+                            if any(kw in str(col).lower() for kw in ['job', 'project', 'status', 'entity', 'vendor']):
+                                kolom_entitas = col
+                                break
+                                
+                        final_df = melted[['Bulan_Laporan', 'Sumber_Sheet', kolom_entitas, 'Tanggal', 'Jumlah_MP']].copy()
+                        final_df.columns = ['File_Sumber', 'Kategori', 'Entitas_Posisi', 'Tanggal', 'Jumlah']
+                        final_df['Kategori'] = 'DW(ARU)'
+                        all_data.append(final_df)
+                continue
+
+            # --- PARSER STANDAR (Temporary, DW(Dedicated), dll) ---
             date_row_idx = None
             for i in range(min(15, len(df))):
                 row_values = df.iloc[i]
@@ -59,7 +106,6 @@ def process_excel(file):
                     break
                     
             if date_row_idx is not None:
-                # 1. Ambil nama kolom mentah dan lakukan deduplikasi agar tidak terjadi error duplicate id_vars
                 raw_cols = df.iloc[date_row_idx].fillna('Deskripsi').tolist()
                 seen = {}
                 new_cols = []
@@ -80,14 +126,12 @@ def process_excel(file):
                 df.columns = new_cols
                 df_data = df.iloc[date_row_idx+1:].dropna(how='all')
                 
-                # Pisahkan kolom Identitas dan kolom Tanggal (1-31)
                 id_vars = [col for col in df.columns if not isinstance(col, (int, float))]
                 value_vars = [col for col in df.columns if isinstance(col, (int, float)) and 1 <= col <= 31]
                 
                 if not value_vars:
                     continue
                 
-                # UNPIVOT DATA (Melt)
                 melted = df_data.melt(
                     id_vars=id_vars, 
                     value_vars=value_vars, 
@@ -95,12 +139,10 @@ def process_excel(file):
                     value_name='Jumlah_MP'
                 )
                 
-                # Tambahkan metadata
                 filename = getattr(file, 'name', 'Laporan Bulanan')
                 melted['Sumber_Sheet'] = sheet
                 melted['Bulan_Laporan'] = filename.split('.')[0]
                 
-                # Cleaning data
                 melted = melted.dropna(subset=['Jumlah_MP'])
                 melted['Jumlah_MP'] = pd.to_numeric(melted['Jumlah_MP'], errors='coerce').fillna(0)
                 melted = melted[melted['Jumlah_MP'] > 0] 
@@ -114,6 +156,7 @@ def process_excel(file):
                             
                     final_df = melted[['Bulan_Laporan', 'Sumber_Sheet', kolom_entitas, 'Tanggal', 'Jumlah_MP']]
                     final_df.columns = ['File_Sumber', 'Kategori', 'Entitas_Posisi', 'Tanggal', 'Jumlah']
+                    final_df['Kategori'] = sheet.strip()
                     all_data.append(final_df)
                     
         except Exception as e:
@@ -157,6 +200,8 @@ with tab2:
                             if not existing_data:
                                 sheet.append_row(['File_Sumber', 'Kategori', 'Entitas_Posisi', 'Tanggal', 'Jumlah'])
                                 
+                            # PENTING: Bersihkan NaN menjadi string kosong agar compliant dengan JSON
+                            extracted_data = extracted_data.fillna("")
                             data_to_upload = extracted_data.astype(str).values.tolist()
                             sheet.append_rows(data_to_upload)
                             
