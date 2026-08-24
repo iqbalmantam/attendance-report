@@ -47,7 +47,6 @@ def process_excel(file):
     xls = pd.ExcelFile(file)
     sheets = xls.sheet_names
     
-    # Hanya izinkan 5 worksheet ini (case-insensitive)
     target_sheets = ['attendance', 'os', 'fix', 'dw(dedicated)', 'dw(aru)']
     
     all_data = []
@@ -236,7 +235,6 @@ with tab2:
                             if not existing_data:
                                 sheet.append_row(['File_Sumber', 'Kategori', 'Entitas_Posisi', 'Tanggal', 'Jumlah'])
                                 
-                            # Bersihkan NaN agar JSON compliant
                             extracted_data = extracted_data.fillna("")
                             data_to_upload = extracted_data.astype(str).values.tolist()
                             sheet.append_rows(data_to_upload)
@@ -260,9 +258,10 @@ with tab1:
             if records:
                 df_db = pd.DataFrame(records)
         except Exception as e:
-            st.warning("Belum ada data tersimpan di Google Sheets atau koneksi gagal.")
+            st.warning("Gagal terhubung ke Google Sheets atau file masih kosong.")
         
-    if not df_db.empty:
+    # --- SAFETY CHECK AGAR TIDAK ERROR KETIKA DATA KOSONG ---
+    if not df_db.empty and 'Jumlah' in df_db.columns:
         df_db['Jumlah'] = pd.to_numeric(df_db['Jumlah'], errors='coerce').fillna(0)
         df_db['Tanggal'] = pd.to_numeric(df_db['Tanggal'], errors='coerce')
         
@@ -329,7 +328,7 @@ with tab1:
             with st.expander("Lihat Data Mentah (Tersimpan di GSheet)"):
                 st.dataframe(df_db, use_container_width=True)
     else:
-        st.info("Belum ada data di Google Sheets. Silakan ke tab 'Upload & Sinkronisasi Data' untuk mengunggah laporan Anda.")
+        st.info("⚠️ Belum ada data di Google Sheets atau kolom belum terbentuk. Silakan pergi ke tab **'Upload & Sinkronisasi Data'**, lalu upload file Excel Anda dan klik tombol **'Simpan ke Google Sheets'**.")
 
 # ==========================================
 # 4. WATERMARK FOOTER
